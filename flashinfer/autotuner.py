@@ -2,6 +2,7 @@ import contextlib
 import copy
 import inspect
 import itertools
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -15,6 +16,10 @@ from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
 
+def get_json_path():
+    device_name = torch.cuda.get_device_name(0).replace(" ", "_")
+    path = "trtllm_fused_moe_" + f"{device_name}.json"
+    return path
 
 @dataclass(slots=True, unsafe_hash=True)
 class DynamicTensorSpec:
@@ -265,6 +270,17 @@ class AutoTunerStatistics:
         return stats_str
 
 
+import json
+@lru_cache(maxsize=None)
+def load_from_json(key):
+    with open(get_json_path(), "r") as f:
+        configs = json.load(f)
+    k = str((key[0], key[1], key[3]))
+    if k in configs:
+        return True, configs[k][0], configs[k][1], None
+    return False, 0, -1, None
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -316,10 +332,19 @@ class AutoTuner:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
         for r in runners:
-            if (
-                cache_key := AutoTuner._get_cache_key(
+            cache_key = AutoTuner._get_cache_key(
                     custom_op, r, input_shapes, tuning_config
                 )
+            load_from_file = os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1" and not self.is_tuning_mode
+            if load_from_file:
+                output = load_from_json(cache_key)
+                if output[0]:
+                    logger.info_once(f"[Autotuner]: success load from file: {cache_key}")
+                else:
+                    logger.info_once(f"[Autotuner]: failed load from file: {cache_key}")
+                return output
+            elif (
+                cache_key
             ) in self.profiling_cache:
                 return True, *self.profiling_cache[cache_key]
 

@@ -23,24 +23,24 @@ import flashinfer.fused_moe as fused_moe
 from flashinfer import fp4_quantize
 
 BATCH_SIZES = [
-    1,
-    2,
-    4,
-    8,
-    16,
-    24,
-    32,
-    48,
-    64,
-    96,
-    128,
-    256,
-    512,
-    1024,
-    1536,
-    2048,
-    3072,
-    4096,
+    #1,
+    #2,
+    #4,
+    #8,
+    #16,
+    #24,
+    #32,
+    #48,
+    #64,
+    #96,
+    #128,
+    #256,
+    #512,
+    #1024,
+    #1536,
+    #2048,
+    #3072,
+    10000,
 ]
 
 configs = []
@@ -166,11 +166,11 @@ def bench_cutlass_fused_moe(
     hidden_states = x
     hidden_states, input_sf = fp4_quantize(x, a1_gs)
     repeats = 3
-    from flashinfer.autotuner import AutoTuner, autotune
+    from flashinfer.autotuner import autotune
 
-    AutoTuner.get().clear_cache()
-    with torch.inference_mode(), autotune():
-        for _ in range(2):
+    with torch.inference_mode(), autotune(False):
+        for i in range(1):
+            print(f"XXX autotuning {i}", flush=True)
             _ = fused_moe.cutlass_fused_moe(
                 hidden_states,
                 selected_experts.to(torch.int),
@@ -181,7 +181,9 @@ def bench_cutlass_fused_moe(
                 quant_scales=quant_scales,
                 input_sf=input_sf,
                 output=flash_output,
+                tune_max_num_tokens=16384,
             )
+    print(f"XXX autotuning done and doing actual bench for selected tactic", flush=True)
     ms = do_bench(
         lambda: fused_moe.cutlass_fused_moe(
             hidden_states,
@@ -202,6 +204,8 @@ def bench_cutlass_fused_moe(
 
 
 if __name__ == "__main__":
+    from flashinfer.autotuner import AutoTuner
+    AutoTuner.get().clear_cache()
     for config in test_configs:
         hidden_size = config["hidden_size"]
         num_experts = config["num_experts"]
@@ -215,3 +219,15 @@ if __name__ == "__main__":
                 top_k,
                 intermediate_size,
             )
+    from flashinfer.autotuner import get_json_path
+    import json
+    configs = AutoTuner.get().profiling_cache
+    if configs:
+        print(f"Found profile cache after autotune")
+        # The original key contains a runner's hash in k[2] which might be different across machines.
+        # So, we remove it for now. v[0] and v[1] are the runner id and the tactic.
+        converted = {str((k[0], k[1], k[3])): (v[0], v[1]) for k, v in configs.items()}
+        json_path = get_json_path()
+        with open(json_path, "w") as f:
+            json.dump(converted, f, indent=4)
+        print(f"Saved the cache to {json_path}")
