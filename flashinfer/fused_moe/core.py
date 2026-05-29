@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os  # FI BF16 tactic debug
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1263,6 +1264,29 @@ def get_trtllm_moe_sm100_module():
             # Choose the appropriate operation based on data types
             if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
                 # BF16 operations
+                tactic_arg = [-1, -1] if tactic == -1 else tactic
+                force_tactic = os.environ.get(
+                    "FLASHINFER_FORCE_TRTLLM_BF16_MOE_TACTIC"
+                )
+                if force_tactic:
+                    try:
+                        tactic_parts = [
+                            int(part.strip()) for part in force_tactic.split(",")
+                        ]
+                    except ValueError as err:
+                        raise ValueError(
+                            "FLASHINFER_FORCE_TRTLLM_BF16_MOE_TACTIC must be "
+                            "formatted as 'tile_N,moe_tactic'"
+                        ) from err
+                    if len(tactic_parts) != 2:
+                        raise ValueError(
+                            "FLASHINFER_FORCE_TRTLLM_BF16_MOE_TACTIC must be "
+                            "formatted as 'tile_N,moe_tactic'"
+                        )
+                    tactic_arg = tactic_parts
+
+                # C++ prepare_moe_common handles valid-config debug output.
+
                 moe_op.trtllm_bf16_moe(
                     routing_logits,
                     kwargs["routing_bias"],
@@ -1285,7 +1309,7 @@ def get_trtllm_moe_sm100_module():
                     kwargs["weight_layout"],
                     kwargs["do_finalize"],
                     kwargs["enable_pdl"],
-                    [-1, -1] if tactic == -1 else tactic,
+                    tactic_arg,
                     self.activation_type,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
@@ -1568,6 +1592,27 @@ def get_trtllm_moe_sm100_module():
             activation_type=activation_type,
         )
 
+        tactic_arg = [-1, -1] if tactic == -1 else tactic
+        force_tactic = os.environ.get("FLASHINFER_FORCE_TRTLLM_BF16_MOE_TACTIC")
+        if force_tactic:
+            try:
+                tactic_parts = [int(part.strip()) for part in force_tactic.split(",")]
+            except ValueError as err:
+                raise ValueError(
+                    "FLASHINFER_FORCE_TRTLLM_BF16_MOE_TACTIC must be formatted "
+                    "as 'tile_N,moe_tactic'"
+                ) from err
+            if len(tactic_parts) != 2:
+                raise ValueError(
+                    "FLASHINFER_FORCE_TRTLLM_BF16_MOE_TACTIC must be formatted "
+                    "as 'tile_N,moe_tactic'"
+                )
+            tactic_arg = tactic_parts
+
+        # C++ prepare_moe_common handles valid-config debug output.
+        if os.environ.get("FLASHINFER_DEBUG_DISABLE_TRTLLM_BF16_MOE_PDL") == "1":
+            enable_pdl = False
+
         # Call the C++ function with the selected tactic
         intermediate_output = moe_op.trtllm_bf16_moe(
             routing_logits,
@@ -1591,7 +1636,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout,
             do_finalize,
             enable_pdl,
-            [-1, -1] if tactic == -1 else tactic,
+            tactic_arg,
             activation_type,
             norm_topk_prob,
             routing_replay_out,

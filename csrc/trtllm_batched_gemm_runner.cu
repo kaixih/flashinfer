@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -35,6 +39,71 @@ using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
+namespace {
+
+bool isBmmPtrTraceEnabled() {
+  char const* value = std::getenv("FLASHINFER_DEBUG_TRTLLM_BMM_PTRS");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+int32_t bmmPtrTraceLimit() {
+  char const* value = std::getenv("FLASHINFER_DEBUG_TRTLLM_BMM_PTRS_LIMIT");
+  if (value == nullptr || value[0] == '\0') {
+    return 4000;
+  }
+  char* end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value || parsed < 0) {
+    return 4000;
+  }
+  return static_cast<int32_t>(parsed);
+}
+
+bool shouldTraceBmmPtr(int32_t* traceIndex) {
+  static std::atomic<int32_t> count{0};
+  if (!isBmmPtrTraceEnabled()) {
+    return false;
+  }
+  int32_t index = count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= bmmPtrTraceLimit()) {
+    return false;
+  }
+  *traceIndex = index + 1;
+  return true;
+}
+
+unsigned long long ptrMod(void const* ptr, std::uintptr_t alignment) {
+  return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(ptr) % alignment);
+}
+
+void traceGemmDataInputPtrs(char const* stage, char const* ptrAName, void const* ptrA,
+                            char const* ptrBName, void const* ptrB, int32_t m, int32_t n, int32_t k,
+                            int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
+                            int32_t configIndex, CUstream stream, int device,
+                            bool transposeMmaOutput, bool routeAct) {
+  int32_t traceIndex = 0;
+  if (!shouldTraceBmmPtr(&traceIndex)) {
+    return;
+  }
+  std::fprintf(stderr,
+               "FI_TRTLLM_BMM_PTR site=batched_gemm_runner stage=%s traceIndex=%d "
+               "gemmData.mInputBuffers.mPtrA_name=%s gemmData.mInputBuffers.mPtrA=%p "
+               "mPtrA_mod16=%llu mPtrA_mod32=%llu mPtrA_mod64=%llu mPtrA_mod128=%llu "
+               "mPtrA_mod256=%llu gemmData.mInputBuffers.mPtrB_name=%s "
+               "gemmData.mInputBuffers.mPtrB=%p mPtrB_mod16=%llu mPtrB_mod32=%llu "
+               "mPtrB_mod64=%llu mPtrB_mod128=%llu mPtrB_mod256=%llu m=%d n=%d k=%d "
+               "numTokens=%d numBatches=%d maxNumCtasInBatchDim=%d configIndex=%d stream=%p "
+               "device=%d transposeMmaOutput=%d routeAct=%d\n",
+               stage, traceIndex, ptrAName, ptrA, ptrMod(ptrA, 16), ptrMod(ptrA, 32),
+               ptrMod(ptrA, 64), ptrMod(ptrA, 128), ptrMod(ptrA, 256), ptrBName, ptrB,
+               ptrMod(ptrB, 16), ptrMod(ptrB, 32), ptrMod(ptrB, 64), ptrMod(ptrB, 128),
+               ptrMod(ptrB, 256), m, n, k, numTokens, numBatches, maxNumCtasInBatchDim, configIndex,
+               static_cast<void*>(stream), device, static_cast<int>(transposeMmaOutput),
+               static_cast<int>(routeAct));
+}
+
+}  // namespace
 
 std::vector<int64_t> prioritizePredefinedConfigs(
     int m, int n, int k, std::vector<int64_t> const& sortedIndices,
@@ -235,6 +304,11 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrA = mOptions.transposeMmaOutput ? b : a;
   gemmData.mInputBuffers.mPtrSfA = mOptions.transposeMmaOutput ? sfB : sfA;
   gemmData.mInputBuffers.mPtrB = mOptions.transposeMmaOutput ? a : b;
+  traceGemmDataInputPtrs(
+      mOptions.routeAct ? "GEMM1" : "GEMM2", mOptions.routeAct ? "gemm1_weights" : "gemm2_weights",
+      gemmData.mInputBuffers.mPtrA, mOptions.routeAct ? "hidden_states" : "workspace.gemm1_output",
+      gemmData.mInputBuffers.mPtrB, m, n, k, numTokens, numBatches, maxNumCtasInBatchDim,
+      configIndex, stream, device, mOptions.transposeMmaOutput, mOptions.routeAct);
   gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? sfA : sfB;
   gemmData.mInputBuffers.mPtrScaleC = scaleC;
   gemmData.mInputBuffers.mPtrScaleGate = scaleGateC;
@@ -421,12 +495,71 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   for (auto const& configIndex : prioritizedIndices) {
     auto isValidConfig = bmm.isValidConfig(configs[configIndex], gemmData);
     if (isValidConfig) {
+      if (!mOptions.routeAct && m == 4 && n == 2048 && k == 128 && numTokens == 4) {
+        auto const& options = configs[configIndex].mOptions;
+        auto const* function_name = configs[configIndex].mFunctionName;
+        bool const is_t128x8x128 =
+            options.mTileM == 128 && options.mTileN == 8 && options.mTileK == 128;
+        bool const skip_schpd =
+            std::getenv("FLASHINFER_DEBUG_SKIP_TRTLLM_BMM_T128X8X128_SCHPD") != nullptr &&
+            is_t128x8x128 && std::strstr(function_name, "schPd2x1x2x3") != nullptr;
+        bool const skip_all_t128x8x128 =
+            std::getenv("FLASHINFER_DEBUG_SKIP_TRTLLM_BMM_T128X8X128_ALL") != nullptr &&
+            is_t128x8x128;
+        if (skip_schpd || skip_all_t128x8x128) {
+          std::fprintf(stderr,
+                       "FI_TRTLLM_BMM_SKIP_KERNEL stage=GEMM2 configIndex=%ld "
+                       "m=%d n=%d k=%d numTokens=%d tileM=%d tileN=%d tileK=%d "
+                       "functionName=%s\n",
+                       static_cast<long>(configIndex), m, n, k, numTokens, options.mTileM,
+                       options.mTileN, options.mTileK, function_name);
+          continue;
+        }
+      }
       validConfigIndices.push_back(configIndex);
     }
   }
 
   FLASHINFER_CHECK(!validConfigIndices.empty(),
                    "No valid config found for the given problem shape");
+
+  if (std::getenv("FLASHINFER_DEBUG_TRTLLM_BMM_VALID_KERNELS") != nullptr) {
+    int32_t print_limit = 16;
+    if (char const* limit_env = std::getenv("FLASHINFER_DEBUG_TRTLLM_BMM_VALID_KERNELS_LIMIT")) {
+      char* end = nullptr;
+      long parsed = std::strtol(limit_env, &end, 10);
+      if (end != limit_env && parsed >= 0) {
+        print_limit = static_cast<int32_t>(parsed);
+      }
+    }
+    bool const target_gemm2_shape =
+        !mOptions.routeAct && m == 4 && n == 2048 && k == 128 && numTokens == 4;
+    bool const print_all = std::getenv("FLASHINFER_DEBUG_TRTLLM_BMM_VALID_KERNELS_ALL") != nullptr;
+    if (print_all || target_gemm2_shape) {
+      static std::atomic<int32_t> valid_kernel_print_count{0};
+      int32_t print_index = valid_kernel_print_count.fetch_add(1, std::memory_order_relaxed);
+      if (print_index < print_limit) {
+        std::fprintf(stderr,
+                     "FI_TRTLLM_BMM_VALID_KERNELS traceIndex=%d stage=%s m=%d n=%d k=%d "
+                     "numTokens=%d numBatches=%d maxNumCtasInBatchDim=%d valid_count=%zu\n",
+                     print_index + 1, mOptions.routeAct ? "GEMM1" : "GEMM2", m, n, k, numTokens,
+                     numBatches, maxNumCtasInBatchDim, validConfigIndices.size());
+        for (auto const& valid_index : validConfigIndices) {
+          auto const& valid_config = configs[valid_index];
+          auto const& options = valid_config.mOptions;
+          std::fprintf(stderr,
+                       "FI_TRTLLM_BMM_VALID_KERNEL stage=%s configIndex=%ld "
+                       "tileM=%d tileN=%d tileK=%d epilogueTileM=%d clusterDimZ=%d "
+                       "scheduler=%d unroll2x=%d functionName=%s\n",
+                       mOptions.routeAct ? "GEMM1" : "GEMM2", static_cast<long>(valid_index),
+                       options.mTileM, options.mTileN, options.mTileK, options.mEpilogueTileM,
+                       options.mClusterDimZ, static_cast<int>(options.mTileScheduler),
+                       static_cast<int>(options.mUseUnrollLoop2xForMma),
+                       valid_config.mFunctionName);
+        }
+      }
+    }
+  }
 
   return validConfigIndices;
 }

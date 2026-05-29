@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 #include "flashinfer/exception.h"
@@ -30,6 +35,80 @@ namespace kernels {
 namespace trtllmgen_moe {
 
 namespace btg = batchedGemm::trtllm::gen;
+
+namespace {
+
+bool isBmmPtrTraceEnabled() {
+  char const* value = std::getenv("FLASHINFER_DEBUG_TRTLLM_BMM_PTRS");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+int32_t bmmPtrTraceLimit() {
+  char const* value = std::getenv("FLASHINFER_DEBUG_TRTLLM_BMM_PTRS_LIMIT");
+  if (value == nullptr || value[0] == '\0') {
+    return 4000;
+  }
+  char* end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value || parsed < 0) {
+    return 4000;
+  }
+  return static_cast<int32_t>(parsed);
+}
+
+bool shouldTraceBmmPtr(int32_t* traceIndex) {
+  static std::atomic<int32_t> count{0};
+  if (!isBmmPtrTraceEnabled()) {
+    return false;
+  }
+  int32_t index = count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= bmmPtrTraceLimit()) {
+    return false;
+  }
+  *traceIndex = index + 1;
+  return true;
+}
+
+unsigned long long ptrMod(void const* ptr, std::uintptr_t alignment) {
+  return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(ptr) % alignment);
+}
+
+void traceBmmPtrCallSite(char const* stage, char const* ptrAName, void const* ptrA,
+                         char const* ptrBName, void const* ptrB, int32_t numTokens, int32_t topK,
+                         int32_t hiddenSize, int32_t intermediateSize, int32_t maxNumCtasInBatchDim,
+                         int32_t configIndex, cudaStream_t stream, int device) {
+  int32_t traceIndex = 0;
+  if (!shouldTraceBmmPtr(&traceIndex)) {
+    return;
+  }
+  std::fprintf(
+      stderr,
+      "FI_TRTLLM_BMM_PTR site=fused_moe_runner stage=%s traceIndex=%d mPtrA_name=%s mPtrA=%p "
+      "mPtrA_mod16=%llu mPtrA_mod32=%llu mPtrA_mod64=%llu mPtrA_mod128=%llu "
+      "mPtrA_mod256=%llu mPtrB_name=%s mPtrB=%p mPtrB_mod16=%llu mPtrB_mod32=%llu "
+      "mPtrB_mod64=%llu mPtrB_mod128=%llu mPtrB_mod256=%llu numTokens=%d topK=%d "
+      "hiddenSize=%d intermediateSize=%d maxNumCtasInBatchDim=%d configIndex=%d stream=%p "
+      "device=%d\n",
+      stage, traceIndex, ptrAName, ptrA, ptrMod(ptrA, 16), ptrMod(ptrA, 32), ptrMod(ptrA, 64),
+      ptrMod(ptrA, 128), ptrMod(ptrA, 256), ptrBName, ptrB, ptrMod(ptrB, 16), ptrMod(ptrB, 32),
+      ptrMod(ptrB, 64), ptrMod(ptrB, 128), ptrMod(ptrB, 256), numTokens, topK, hiddenSize,
+      intermediateSize, maxNumCtasInBatchDim, configIndex, static_cast<void*>(stream), device);
+}
+
+bool shouldTraceMoeSelectedConfig(int32_t* traceIndex) {
+  static std::atomic<int32_t> count{0};
+  if (!isBmmPtrTraceEnabled()) {
+    return false;
+  }
+  int32_t index = count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= bmmPtrTraceLimit()) {
+    return false;
+  }
+  *traceIndex = index + 1;
+  return true;
+}
+
+}  // namespace
 
 namespace Routing {
 namespace {
@@ -420,6 +499,9 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
+  traceBmmPtrCallSite("GEMM1", "gemm1_weights", weights, "hidden_states", hiddenState, numTokens,
+                      topK, hiddenSize, intermediateSize, maxNumCtasInBatchDim, configIndex, stream,
+                      device);
   mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {}, numTokens,
               numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights,
               weightsScale, perTokenScales, perChannelScales, outputScalesScalar,
@@ -516,6 +598,9 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  traceBmmPtrCallSite("GEMM2", "gemm2_weights", weights, "workspace.gemm1_output",
+                      permutedHiddenState, numTokens, topK, hiddenSize, intermediateSize,
+                      maxNumCtasInBatchDim, configIndex, stream, device);
   mRunner.run(
       numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
       permutedHiddenState, permutedHiddenStateScale, weights, weightsScale,
@@ -730,6 +815,18 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   void* hidden_states_scale_linear{args.hidden_states_scale};
 
   auto const& config = mPassingConfigs[configIndex];
+
+  int32_t moeConfigTraceIndex = 0;
+  if (shouldTraceMoeSelectedConfig(&moeConfigTraceIndex)) {
+    std::fprintf(stderr,
+                 "FI_TRTLLM_MOE_SELECTED_CONFIG traceIndex=%d moeConfigIndex=%ld "
+                 "gemm1Config=%d gemm2Config=%d passingConfigCount=%zu numTokens=%d topK=%d "
+                 "hiddenSize=%d intermediateSize=%d localNumExperts=%d stream=%p device=%d\n",
+                 moeConfigTraceIndex, static_cast<long>(configIndex), config.gemm1Config,
+                 config.gemm2Config, mPassingConfigs.size(), args.num_tokens, args.top_k,
+                 args.hidden_size, args.intermediate_size, args.local_num_experts,
+                 static_cast<void*>(stream), device);
+  }
 
   mPermuteGemm1.run(
       args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,

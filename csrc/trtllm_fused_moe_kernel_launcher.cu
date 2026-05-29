@@ -16,7 +16,10 @@
 #include <nvrtc.h>
 
 #include <algorithm>
+#include <atomic>  // FI tactic debug
 #include <cmath>
+#include <cstdio>   // FI tactic debug
+#include <cstdlib>  // FI tactic debug
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -455,6 +458,74 @@ class FusedMoeLauncher {
     auto valid_cfgs =
         moe_runner->getValidConfigIndices(args->top_k, args->hidden_size, args->intermediate_size,
                                           args->local_num_experts, args->num_tokens);
+
+    char const* force_moe_config = std::getenv("FLASHINFER_FORCE_TRTLLM_MOE_CONFIG_INDEX");
+    if (force_moe_config != nullptr && force_moe_config[0] != '\0') {
+      char* end = nullptr;
+      long parsed = std::strtol(force_moe_config, &end, 10);
+      bool force_matches = true;
+      if (char const* target_tile_n = std::getenv("FLASHINFER_FORCE_TRTLLM_MOE_CONFIG_TILE_N")) {
+        char* target_end = nullptr;
+        long target = std::strtol(target_tile_n, &target_end, 10);
+        if (target_end != target_tile_n && target >= 0 && target != tile_tokens_dim) {
+          force_matches = false;
+        }
+      }
+      if (char const* target_num_tokens =
+              std::getenv("FLASHINFER_FORCE_TRTLLM_MOE_CONFIG_NUM_TOKENS")) {
+        char* target_end = nullptr;
+        long target = std::strtol(target_num_tokens, &target_end, 10);
+        if (target_end != target_num_tokens && target >= 0 && target != args->num_tokens) {
+          force_matches = false;
+        }
+      }
+      if (force_matches && end != force_moe_config && parsed >= 0) {
+        std::fprintf(stderr,
+                     "FI_TRTLLM_MOE_FORCE_CONFIG requested=%ld previous=%ld tile_N=%ld "
+                     "numTokens=%d topK=%d hiddenSize=%d intermediateSize=%d "
+                     "localNumExperts=%d\n",
+                     parsed, static_cast<long>(moe_tactic), static_cast<long>(tile_tokens_dim),
+                     args->num_tokens, args->top_k, args->hidden_size, args->intermediate_size,
+                     args->local_num_experts);
+        moe_tactic = parsed;
+      }
+    }
+
+    if (std::getenv("FLASHINFER_DEBUG_TRTLLM_MOE_VALID_CFGS") != nullptr) {
+      static std::atomic<int32_t> valid_cfg_print_count{0};
+      int32_t print_index = valid_cfg_print_count.fetch_add(1, std::memory_order_relaxed);
+      int32_t print_limit = 32;
+      if (char const* limit_env = std::getenv("FLASHINFER_DEBUG_TRTLLM_MOE_VALID_CFGS_LIMIT")) {
+        char* end = nullptr;
+        long parsed = std::strtol(limit_env, &end, 10);
+        if (end != limit_env && parsed >= 0) {
+          print_limit = static_cast<int32_t>(parsed);
+        }
+      }
+      if (print_index < print_limit) {
+        std::fprintf(stderr,
+                     "FI_TRTLLM_MOE_VALID_CFGS traceIndex=%d tile_N=%ld selected=%ld "
+                     "valid_count=%zu numTokens=%d topK=%d hiddenSize=%d intermediateSize=%d "
+                     "localNumExperts=%d values=",
+                     print_index + 1, static_cast<long>(tile_tokens_dim),
+                     static_cast<long>(moe_tactic), valid_cfgs.size(), args->num_tokens,
+                     args->top_k, args->hidden_size, args->intermediate_size,
+                     args->local_num_experts);
+        size_t max_items = valid_cfgs.size();
+        if (char const* max_env = std::getenv("FLASHINFER_DEBUG_TRTLLM_MOE_VALID_CFGS_MAX_ITEMS")) {
+          char* end = nullptr;
+          long parsed = std::strtol(max_env, &end, 10);
+          if (end != max_env && parsed >= 0) {
+            max_items = std::min(max_items, static_cast<size_t>(parsed));
+          }
+        }
+        for (size_t i = 0; i < max_items; ++i) {
+          std::fprintf(stderr, "%s%ld", i == 0 ? "" : ",", static_cast<long>(valid_cfgs[i]));
+        }
+        std::fprintf(stderr, "\n");
+      }
+    }
+
     auto valid_it = std::find(valid_cfgs.begin(), valid_cfgs.end(), moe_tactic);
     FLASHINFER_CHECK(valid_it != valid_cfgs.end(), "Invalid MoE tactic ", moe_tactic,
                      " for tile_N=", tile_tokens_dim, ". Number of valid tactics for this tile is ",

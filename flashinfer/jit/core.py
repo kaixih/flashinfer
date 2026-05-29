@@ -258,6 +258,13 @@ class JitSpec:
 
     @property
     def is_aot(self) -> bool:
+        if os.environ.get("FLASHINFER_FORCE_JIT", "0") == "1":
+            return False
+        if (
+            os.environ.get("FLASHINFER_FORCE_JIT_FUSED_MOE_TRTLLM", "0") == "1"
+            and self.name == "fused_moe_trtllm_sm100"
+        ):
+            return False
         return self.aot_path.exists()
 
     @property
