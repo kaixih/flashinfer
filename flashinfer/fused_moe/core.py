@@ -1271,6 +1271,20 @@ def get_trtllm_moe_sm100_module():
                         f"[Autotuner]: Failed to get valid tactics for {instance_key}. Error occurred: {e}"
                     )
                     return []
+                # WAR: avoid TRTLLM-gen BF16 MoE tile_N=8 for the Qwen3-30B-A3B
+                # first piecewise CUDA graph bucket, which can trigger a TMA OOB IMA on B200.
+                if (
+                    self.dtype_act == DtypeTrtllmGen.Bfloat16
+                    and self.dtype_weights == DtypeTrtllmGen.Bfloat16
+                    and self.top_k == 8
+                    and self.hidden_size == 2048
+                    and self.intermediate_size == 768
+                    and num_tokens == 4
+                    and not has_gemm1_lora_delta
+                ):
+                    filtered_tactics = [t for t in valid_tactics if int(t[0]) != 8]
+                    if filtered_tactics:
+                        valid_tactics = filtered_tactics
                 MoERunner.valid_tactics_dict[instance_key] = valid_tactics
             return MoERunner.valid_tactics_dict[instance_key]
 
