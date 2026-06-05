@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum
 from types import SimpleNamespace
@@ -1309,6 +1310,34 @@ def get_trtllm_moe_sm100_module():
             if instance_key not in MoERunner.valid_tactics_dict:
                 try:
                     valid_tactics = moe_op.trtllm_get_valid_moe_configs(*instance_key)
+
+                    # Opt-in WAR for https://github.com/flashinfer-ai/flashinfer/issues/3427.
+                    # Set FLASHINFER_FILTER_BF16_TRTLLM_MOE_TACTICS=1 to filter the
+                    # risky Qwen3 BF16 TRTLLM MoE tactics described below.
+                    # TRTLLM MoE tactics are tuples like (tile_N, config_id): tile_N=8
+                    # maps to the t128x8 family, which can fault for several Qwen3
+                    # token buckets. The (16,47) tactic is a separate observed
+                    # tile_N=16/config 47 choice that can fail for the small-token
+                    # bucket, so keep that extra filter limited to num_tokens in
+                    # (2, 4).
+                    if (
+                        os.environ.get("FLASHINFER_FILTER_BF16_TRTLLM_MOE_TACTICS", "0")
+                        == "1"
+                        and self.dtype_act == DtypeTrtllmGen.Bfloat16
+                        and self.dtype_weights == DtypeTrtllmGen.Bfloat16
+                        and self.top_k == 8
+                    ):
+                        filtered_tactics = [t for t in valid_tactics if int(t[0]) != 8]
+                        if num_tokens in (2, 4):
+                            filtered_tactics = [
+                                t
+                                for t in filtered_tactics
+                                if not (
+                                    len(t) > 1 and int(t[0]) == 16 and int(t[1]) == 47
+                                )
+                            ]
+                        if filtered_tactics:
+                            valid_tactics = filtered_tactics
                 except Exception as e:
                     logger.debug(
                         f"[Autotuner]: Failed to get valid tactics for {instance_key}. Error occurred: {e}"
